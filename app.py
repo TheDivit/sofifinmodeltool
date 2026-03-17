@@ -1,733 +1,912 @@
-#!/usr/bin/env python3
-"""
-app.py — Streamlit web app for extracting financial statement tables from
-digital PDF annual/quarterly reports into a user-provided Excel template.
-
-Internal sections:
-  1. Config & constants
-  2. Numeric parsing utilities
-  3. PDF text scanning (pdfplumber — keyword page detection)
-  4. Table extraction (camelot — lattice→stream fallback)
-  5. LLM helpers (classification & row mapping via OpenAI-compatible API)
-  6. Excel writing (openpyxl — populate template)
-  7. Streamlit UI
-
-Run:
-  streamlit run app.py
-"""
-
 from __future__ import annotations
+
+# ============================================================
+# SECTION 1: IMPORTS & CONFIGURATION
+# ============================================================
 
 import io
 import json
 import os
 import re
 import tempfile
-import datetime
-from copy import copy
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import traceback
+from typing import Any
 
+import camelot
 import pandas as pd
+import requests
 import streamlit as st
 from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from PyPDF2 import PdfReader
 
-# Load .env from this dir *and* parent dir (workspace root) so API keys are available.
-load_dotenv()                                   # sofifinmodeltool/.env
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")  # agents/.env
+load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Ghostscript fix for macOS + Homebrew
-# ctypes.util.find_library("gs") fails on macOS ARM because Homebrew installs
-# libgs.dylib under /opt/homebrew/lib which isn't in the default dylib search
-# path.  We patch camelot's detection so it finds the library correctly.
-# ---------------------------------------------------------------------------
-def _patch_ghostscript_detection() -> None:
-    """Ensure camelot can find Homebrew-installed Ghostscript on macOS."""
-    import sys
-    if sys.platform != "darwin":
-        return
-    from ctypes.util import find_library
-    if find_library("gs") is not None:
-        return  # already findable — nothing to do
+st.set_page_config(
+    page_title="FinStatement Parser",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-    # Add Homebrew lib path to DYLD_FALLBACK_LIBRARY_PATH so both
-    # find_library and the ghostscript ctypes wrapper can locate libgs.
-    homebrew_lib = "/opt/homebrew/lib"
-    gs_lib = os.path.join(homebrew_lib, "libgs.dylib")
-    if os.path.exists(gs_lib):
-        existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
-        if homebrew_lib not in existing:
-            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
-                f"{homebrew_lib}:{existing}" if existing else homebrew_lib
-            )
-        # Also monkey-patch camelot's detection to return True directly
-        try:
-            import camelot.backends.ghostscript_backend as _gsb
-            _gsb.installed_posix = lambda: True
-        except ImportError:
-            pass
+# ============================================================
+# SECTION 2: CONSTANTS & PROVIDER REGISTRY
+# ============================================================
 
-_patch_ghostscript_detection()
-
-# ---------------------------------------------------------------------------
-# 1. Config & constants
-# ---------------------------------------------------------------------------
-
-STATEMENT_TYPES: List[str] = [
-    "Balance Sheet",
-    "P&L / Income Statement",
-    "Cash Flow Statement",
-]
-
-# Keywords used to detect which pages contain which statement (case-insensitive).
-STATEMENT_KEYWORDS: Dict[str, List[str]] = {
-    "Balance Sheet": [
-        "balance sheet",
-        "statement of financial position",
-        "assets and liabilities",
-    ],
-    "P&L / Income Statement": [
-        "profit and loss",
-        "income statement",
-        "statement of operations",
-        "statement of comprehensive income",
-        "statement of profit",
-        "revenue from operations",
-    ],
-    "Cash Flow Statement": [
-        "cash flow",
-        "statement of cash flows",
-        "cash and cash equivalents",
-    ],
+LLM_PROVIDERS: dict[str, dict[str, Any]] = {
+    "OpenAI": {
+        "base_url": "https://api.openai.com/v1",
+        "models_endpoint": "/models",
+        "chat_endpoint": "/chat/completions",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+        "model_filter": lambda m: m.startswith(("gpt-4", "gpt-3.5", "o1", "o3", "o4")),
+        "model_sort_priority": ["gpt-4o", "gpt-4-turbo", "o4-mini", "o3-mini"],
+    },
+    "Anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "models_endpoint": "/models",
+        "chat_endpoint": "/messages",
+        "auth_header": "x-api-key",
+        "auth_prefix": "",
+        "model_filter": lambda m: "claude" in m.lower(),
+        "model_sort_priority": ["claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
+    },
+    "Google Gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "models_endpoint": "/models",
+        "chat_endpoint": None,
+        "auth_header": None,
+        "auth_prefix": "",
+        "model_filter": lambda m: "gemini" in m.lower(),
+        "model_sort_priority": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+    },
 }
 
-# Fuzzy-match threshold (0–100) for mapping Excel sheet names → statement types.
-FUZZY_THRESHOLD = 60
+FALLBACK_MODELS: dict[str, list[str]] = {
+    "OpenAI": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o4-mini", "o3-mini"],
+    "Anthropic": ["claude-sonnet-4-20250514", "claude-haiku-4-20250414"],
+    "Google Gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+}
+
+MAPPING_SYSTEM_PROMPT = """You are a financial data mapping specialist. Your job is to take raw extracted financial statement data (from PDF table extraction) and map it precisely into a provided template structure.
+
+## YOUR TASK
+You will receive:
+1. One or more EXTRACTED TABLES (CSV format) from a financial statement PDF. These may contain Balance Sheet, Profit & Loss, and/or Cash Flow Statement data.
+2. A TEMPLATE (CSV format) that defines the exact output structure required.
+
+You must:
+1. IDENTIFY what type of financial data each extracted table contains.
+2. MAP each row/field from the extracted data to the correct row in the template.
+3. TRANSFORM values as needed:
+   - Standardise number formats (remove commas, handle parentheses as negatives, handle \"Cr\"/\"Dr\" notation).
+   - Convert units if the extracted data uses different units (e.g., thousands vs lakhs vs crores).
+   - Handle merged/split rows — sometimes one template row maps to multiple extracted rows (sum them), or one extracted row maps to multiple template rows.
+4. PRESERVE the template's exact row labels and column structure.
+5. Where data is not available in the extracted tables for a template row, use null.
+
+## OUTPUT FORMAT
+Return ONLY valid JSON (no markdown fencing, no explanation). The JSON must be:
+{
+  \"statement_type\": \"Balance Sheet | Profit & Loss | Cash Flow | Mixed\",
+  \"data_unit\": \"Absolute | Thousands | Lakhs | Crores | Millions\",
+  \"confidence_notes\": [\"list of any assumptions or low-confidence mappings\"],
+  \"mapped_rows\": [
+    {
+      \"template_row_label\": \"exact label from template\",
+      \"values\": {
+        \"column_name_1\": value_or_null,
+        \"column_name_2\": value_or_null
+      },
+      \"source_row\": \"original label from extracted data (for audit trail)\",
+      \"confidence\": \"high | medium | low\"
+    }
+  ],
+  \"unmapped_extracted_rows\": [\"list of extracted row labels that could not be mapped\"],
+  \"unfilled_template_rows\": [\"list of template row labels with no matching data\"]
+}
+
+## CRITICAL RULES
+- Numbers must be plain numbers (no commas, no currency symbols). Use negative numbers, not parentheses.
+- If a value shows \"(1,234)\" or \"1,234 Cr\" or \"-1234\", normalise to -1234.
+- If units differ between source and template, convert. State the conversion in confidence_notes.
+- NEVER fabricate data. If unsure, set value to null and add a confidence_note.
+- Return ONLY the JSON object. No other text."""
 
 
-# ---------------------------------------------------------------------------
-# 2. Numeric parsing utilities
-# ---------------------------------------------------------------------------
+# ============================================================
+# SECTION 3: SESSION STATE INITIALISATION
+# ============================================================
 
-def parse_numeric(raw: str) -> Optional[float]:
-    """Convert a financial-report cell value to a Python float.
+DEFAULTS: dict[str, Any] = {
+    "extracted_tables": [],
+    "extracted_csvs": [],
+    "template_csv": None,
+    "template_df": None,
+    "mapped_data": None,
+    "llm_raw_response": None,
+    "available_models": {},
+    "processing_status": "",
+    "parsing_reports": [],
+    "camelot_settings": {
+        "flavor": "lattice",
+        "line_scale": 40,
+        "split_text": True,
+        "flag_size": True,
+        "strip_text": "\n",
+        "edge_tol": 50,
+        "row_tol": 2,
+    },
+}
 
-    Handles:
-      - commas: 1,234 → 1234
-      - parentheses for negatives: (1,234) → -1234
-      - dash/hyphen meaning zero: '-' → 0
-      - whitespace / currency symbols stripped
-    Returns None if not parseable (i.e. it's a label, not a number).
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ============================================================
+# SECTION 4: HELPER FUNCTIONS — LLM
+# ============================================================
+
+def _sort_models(models: list[str], priorities: list[str]) -> list[str]:
+    """Sort model IDs with priority models first, then alphabetically.
+
+    Args:
+        models: Raw model ID list.
+        priorities: Preferred model prefixes.
+
+    Returns:
+        Sorted model IDs.
     """
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s or s in ("", "-", "—", "–", "nil", "Nil", "NIL"):
-        return 0.0
-    # Detect negative-in-parens: (1,234.56)
-    negative = False
-    if s.startswith("(") and s.endswith(")"):
-        negative = True
-        s = s[1:-1]
-    # Strip currency/whitespace
-    s = re.sub(r"[₹$€£¥,\s]", "", s)
+    unique_models = sorted(set(models))
+    priority_bucket: list[str] = []
+    non_priority_bucket: list[str] = []
+
+    for model in unique_models:
+        if any(model.startswith(p) for p in priorities):
+            priority_bucket.append(model)
+        else:
+            non_priority_bucket.append(model)
+
+    def priority_rank(model_name: str) -> int:
+        for i, p in enumerate(priorities):
+            if model_name.startswith(p):
+                return i
+        return len(priorities)
+
+    priority_bucket.sort(key=lambda m: (priority_rank(m), m))
+    non_priority_bucket.sort()
+    return priority_bucket + non_priority_bucket
+
+
+def fetch_available_models(provider: str, api_key: str) -> list[str]:
+    """Fetch model IDs for the selected provider.
+
+    Args:
+        provider: Provider display name.
+        api_key: Provider API key.
+
+    Returns:
+        List of filtered/sorted model IDs, or fallback models on failure.
+    """
+    if not api_key:
+        st.warning("Please provide an API key before fetching models.")
+        return FALLBACK_MODELS.get(provider, [])
+
+    provider_cfg = LLM_PROVIDERS[provider]
+    url = f"{provider_cfg['base_url']}{provider_cfg['models_endpoint']}"
+
     try:
-        val = float(s)
-        return -val if negative else val
+        if provider == "Google Gemini":
+            url = f"{url}?key={api_key}"
+            response = requests.get(url, timeout=20)
+        else:
+            headers = {
+                provider_cfg["auth_header"]: f"{provider_cfg['auth_prefix']}{api_key}",
+            }
+            if provider == "Anthropic":
+                headers["anthropic-version"] = "2023-06-01"
+            response = requests.get(url, headers=headers, timeout=20)
+
+        response.raise_for_status()
+        payload = response.json()
+
+        model_ids: list[str] = []
+        if provider in {"OpenAI", "Anthropic"}:
+            for item in payload.get("data", []):
+                model_id = item.get("id", "")
+                if model_id:
+                    model_ids.append(model_id)
+        elif provider == "Google Gemini":
+            for item in payload.get("models", []):
+                name = item.get("name", "")
+                model_id = name.split("/")[-1] if name else ""
+                if model_id:
+                    model_ids.append(model_id)
+
+        filtered = [m for m in model_ids if provider_cfg["model_filter"](m)]
+        if not filtered:
+            raise ValueError("No matching models found in provider response.")
+
+        sorted_models = _sort_models(filtered, provider_cfg["model_sort_priority"])
+        st.session_state["available_models"][provider] = sorted_models
+        return sorted_models
+    except Exception as exc:  # pylint: disable=broad-except
+        fallback = FALLBACK_MODELS.get(provider, [])
+        st.warning(
+            f"Model fetch failed for {provider}: {exc}. Using fallback model list instead."
+        )
+        st.session_state["available_models"][provider] = fallback
+        return fallback
+
+
+def call_llm(
+    provider: str,
+    model: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Call a selected LLM provider and return response text.
+
+    Args:
+        provider: Selected provider name.
+        model: Selected model ID.
+        api_key: Provider API key.
+        system_prompt: System instructions.
+        user_prompt: User content.
+
+    Returns:
+        Raw text output from the provider.
+    """
+    try:
+        if provider == "OpenAI":
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                max_tokens=8192,
+            )
+            return resp.choices[0].message.content or ""
+
+        if provider == "Anthropic":
+            from anthropic import Anthropic
+
+            client = Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model=model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                temperature=0,
+                max_tokens=8192,
+            )
+            content_parts = []
+            for block in resp.content:
+                text = getattr(block, "text", None)
+                if text:
+                    content_parts.append(text)
+            return "\n".join(content_parts).strip()
+
+        if provider == "Google Gemini":
+            import google.genai as genai
+
+            client = genai.Client(api_key=api_key)
+            merged_prompt = f"{system_prompt}\n\n{user_prompt}"
+            resp = client.models.generate_content(
+                model=model,
+                contents=merged_prompt,
+                config={"temperature": 0, "max_output_tokens": 8192},
+            )
+            return (getattr(resp, "text", "") or "").strip()
+
+        raise ValueError(f"Unsupported provider: {provider}")
+    except Exception as exc:  # pylint: disable=broad-except
+        st.error(f"LLM call failed: {exc}")
+        raise
+
+
+def build_mapping_prompt(extracted_csvs: list[str], template_csv: str) -> str:
+    """Build mapping prompt from extracted CSV tables and template CSV.
+
+    Args:
+        extracted_csvs: CSV strings from extracted PDF tables.
+        template_csv: Target template CSV.
+
+    Returns:
+        Combined user prompt string.
+    """
+    parts = ["## EXTRACTED TABLES FROM PDF\n"]
+    for i, csv_str in enumerate(extracted_csvs):
+        parts.append(f"### Table {i + 1}\n```csv\n{csv_str}\n```\n")
+    parts.append(f"## TEMPLATE (Target Structure)\n```csv\n{template_csv}\n```\n")
+    parts.append("Map the extracted data into the template structure. Return ONLY JSON.")
+    return "\n".join(parts)
+
+
+def parse_llm_response(raw_response: str) -> dict[str, Any]:
+    """Parse JSON response from LLM, handling common formatting wrappers.
+
+    Args:
+        raw_response: Raw LLM text.
+
+    Returns:
+        Parsed JSON object.
+    """
+    cleaned = raw_response.strip()
+
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    if cleaned.lower().startswith("json"):
+        cleaned = cleaned[4:].strip()
+
+    return json.loads(cleaned)
+
+
+def validate_mapped_data_structure(mapped_data: dict[str, Any]) -> None:
+    """Validate minimum schema expected from LLM output.
+
+    Args:
+        mapped_data: Parsed mapping payload.
+
+    Raises:
+        ValueError: If required keys are missing or malformed.
+    """
+    required_root = {
+        "statement_type",
+        "data_unit",
+        "confidence_notes",
+        "mapped_rows",
+        "unmapped_extracted_rows",
+        "unfilled_template_rows",
+    }
+    missing = required_root.difference(mapped_data.keys())
+    if missing:
+        raise ValueError(f"Missing required JSON keys: {sorted(missing)}")
+
+    if not isinstance(mapped_data.get("mapped_rows"), list):
+        raise ValueError("'mapped_rows' must be a list.")
+
+
+# ============================================================
+# SECTION 5: HELPER FUNCTIONS — CAMELOT EXTRACTION
+# ============================================================
+
+def extract_tables_from_pdf(
+    pdf_path: str,
+    pages: str,
+    flavor: str = "lattice",
+) -> tuple[list[pd.DataFrame], list[str]]:
+    """Extract tables from specified pages of a PDF using Camelot.
+
+    Args:
+        pdf_path: Path to PDF file.
+        pages: Page numbers/ranges like "1,3,5-7".
+        flavor: Camelot flavor ("lattice" or "stream").
+
+    Returns:
+        A tuple containing:
+            - list of pandas DataFrames
+            - list of CSV strings
+    """
+    camelot_settings = st.session_state.get("camelot_settings", {})
+    kwargs: dict[str, Any] = {
+        "flavor": flavor,
+        "split_text": bool(camelot_settings.get("split_text", True)),
+        "flag_size": bool(camelot_settings.get("flag_size", True)),
+        "strip_text": str(camelot_settings.get("strip_text", "\n")),
+    }
+
+    if flavor == "lattice":
+        kwargs["line_scale"] = int(camelot_settings.get("line_scale", 40))
+    else:
+        kwargs["edge_tol"] = int(camelot_settings.get("edge_tol", 50))
+        kwargs["row_tol"] = int(camelot_settings.get("row_tol", 2))
+
+    tables = camelot.read_pdf(pdf_path, pages=pages, **kwargs)
+    dataframes: list[pd.DataFrame] = []
+    csvs: list[str] = []
+    reports: list[dict[str, Any]] = []
+
+    for table in tables:
+        df = table.df
+        csv_text = df.to_csv(index=False)
+        dataframes.append(df)
+        csvs.append(csv_text)
+        reports.append(table.parsing_report)
+
+    st.session_state["parsing_reports"] = reports
+    return dataframes, csvs
+
+
+# ============================================================
+# SECTION 6: HELPER FUNCTIONS — EXCEL GENERATION
+# ============================================================
+
+def _normalize_numeric(value: Any) -> float | int | None:
+    """Normalize mixed numeric string formats into numeric values.
+
+    Args:
+        value: Any value from mapped JSON.
+
+    Returns:
+        int/float if parseable, else None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+
+    text = str(value).strip()
+    if text == "":
+        return None
+
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1].strip()
+
+    text = text.replace(",", "")
+    text = re.sub(r"\s*(Cr|Dr)$", "", text, flags=re.IGNORECASE)
+    text = text.replace("$", "").replace("₹", "")
+
+    try:
+        number = float(text)
+        if negative:
+            number = -number
+        if number.is_integer():
+            return int(number)
+        return number
     except ValueError:
         return None
 
 
-def detect_numeric_columns(df: pd.DataFrame) -> List[int]:
-    """Return column indices that contain at least 30 % numeric cells."""
-    num_cols = []
-    for col_idx in range(df.shape[1]):
-        col = df.iloc[:, col_idx]
-        parsed = col.apply(lambda x: parse_numeric(str(x)) is not None)
-        if parsed.mean() >= 0.30:
-            num_cols.append(col_idx)
-    return num_cols
+def generate_excel(mapped_data: dict[str, Any], template_df: pd.DataFrame) -> bytes:
+    """Generate formatted Excel output from mapped data and template DataFrame.
 
+    Args:
+        mapped_data: LLM mapping JSON.
+        template_df: Template DataFrame preserving output structure.
 
-def detect_scale_from_header(df: pd.DataFrame) -> str:
-    """Heuristic: look for '₹ in crores', 'in millions', etc. in first 3 rows."""
-    header_text = " ".join(str(v) for v in df.iloc[:3].values.flatten())
-    header_lower = header_text.lower()
-    for kw in ("crore", "crores"):
-        if kw in header_lower:
-            return "Crores"
-    for kw in ("lakh", "lakhs"):
-        if kw in header_lower:
-            return "Lakhs"
-    for kw in ("million", "millions"):
-        if kw in header_lower:
-            return "Millions"
-    for kw in ("billion", "billions"):
-        if kw in header_lower:
-            return "Billions"
-    for kw in ("thousand", "thousands"):
-        if kw in header_lower:
-            return "Thousands"
-    return "Unknown"
-
-
-# ---------------------------------------------------------------------------
-# 3. PDF text scanning — locate pages per statement type
-# ---------------------------------------------------------------------------
-
-def find_pages_for_statement(
-    pdf_path: str, statement_type: str
-) -> List[int]:
-    """Scan every page's text layer for keywords; return 1-indexed page numbers."""
-    import pdfplumber
-
-    keywords = STATEMENT_KEYWORDS.get(statement_type, [])
-    if not keywords:
-        return []
-
-    matched: List[int] = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            text = (page.extract_text() or "").lower()
-            if any(kw in text for kw in keywords):
-                matched.append(i)
-    return matched
-
-
-# ---------------------------------------------------------------------------
-# 4. Table extraction (camelot)
-# ---------------------------------------------------------------------------
-
-def extract_tables_from_page(
-    pdf_path: str,
-    page: int,
-    flavor: str = "lattice",
-) -> List[pd.DataFrame]:
-    """Extract tables from a single page.  Falls back lattice → stream.
-
-    Lattice mode uses the default ghostscript backend (must be installed:
-    `brew install ghostscript`).
+    Returns:
+        Excel file content as bytes.
     """
-    import camelot
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        raise RuntimeError("Failed to get active worksheet.")
+    ws.title = "Financial Statement"
 
-    tables = camelot.read_pdf(pdf_path, pages=str(page), flavor=flavor)
-    if len(tables) == 0 and flavor == "lattice":
-        tables = camelot.read_pdf(pdf_path, pages=str(page), flavor="stream")
-    return [t.df for t in tables]
-
-
-def pick_best_table(dfs: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    """From candidate tables on a page, pick the one most likely to be the
-    financial statement: most rows with ≥ 2 numeric columns.  If tables share
-    column structure they may be continuation fragments → concatenate."""
-    if not dfs:
-        return None
-    if len(dfs) == 1:
-        return dfs[0]
-
-    scored: List[Tuple[int, int, pd.DataFrame]] = []
-    for df in dfs:
-        n_num = len(detect_numeric_columns(df))
-        scored.append((len(df), n_num, df))
-
-    # Check if multiple tables share column count → concatenate
-    col_counts = [df.shape[1] for df in dfs]
-    if len(set(col_counts)) == 1:
-        merged = pd.concat(dfs, ignore_index=True)
-        return merged
-
-    # Otherwise pick table with most rows that has ≥ 2 numeric columns
-    candidates = [(rows, ncols, df) for rows, ncols, df in scored if ncols >= 2]
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][2]
-
-    # Fallback: biggest table
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][2]
-
-
-# ---------------------------------------------------------------------------
-# 5. LLM helpers
-# ---------------------------------------------------------------------------
-
-def _llm_call(
-    messages: List[Dict[str, str]],
-    api_key: str,
-    model: str,
-    base_url: str | None = None,
-) -> str:
-    """Low-level chat completion wrapper (OpenAI-compatible)."""
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key, base_url=base_url or None)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0,
-        max_tokens=2048,
+    thin_border = Border(
+        left=Side(style="thin", color="DDDDDD"),
+        right=Side(style="thin", color="DDDDDD"),
+        top=Side(style="thin", color="DDDDDD"),
+        bottom=Side(style="thin", color="DDDDDD"),
     )
-    return resp.choices[0].message.content.strip()
+    total_top_border = Border(top=Side(style="thin", color="000000"))
 
+    headers = list(template_df.columns)
+    if len(headers) < 1:
+        raise ValueError("Template must contain at least one column.")
 
-def classify_table_as_statement(
-    table_md: str,
-    statement_type: str,
-    api_key: str,
-    model: str,
-    base_url: str | None = None,
-) -> bool:
-    """Ask the LLM: does this table represent *statement_type*?  Returns bool."""
-    prompt = (
-        f"You are a financial document analyst.\n"
-        f"Below is a table extracted from a PDF financial report (in Markdown).\n\n"
-        f"{table_md}\n\n"
-        f'Does this table represent a "{statement_type}"?\n'
-        f"Reply ONLY with YES or NO on the first line, then a one-sentence explanation."
-    )
-    answer = _llm_call(
-        [{"role": "user", "content": prompt}],
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-    )
-    return answer.upper().startswith("YES")
+    output_headers = headers + ["Notes"]
 
+    for col_idx, header in enumerate(output_headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="003366")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
 
-def map_rows_with_llm(
-    table_md: str,
-    template_labels: List[str],
-    api_key: str,
-    model: str,
-    base_url: str | None = None,
-    retry: bool = True,
-) -> Dict[str, Optional[str]]:
-    """Ask the LLM to map each template row label to the best matching
-    extracted row label.  Returns {template_label: matched_label_or_None}.
-    """
-    labels_block = "\n".join(f"- {lbl}" for lbl in template_labels)
-    prompt = (
-        "You are a financial data extraction assistant.\n\n"
-        "## Extracted table (Markdown)\n\n"
-        f"{table_md}\n\n"
-        "## Template row labels\n\n"
-        f"{labels_block}\n\n"
-        "Map each template row label to the best matching row label in the "
-        "extracted table. If no reasonable match exists, map it to null.\n\n"
-        "Return ONLY a valid JSON object (no markdown fences) with this schema:\n"
-        '{ "template_row_label": "matched_extracted_row_label_or_null" }\n'
-    )
-    raw = _llm_call(
-        [{"role": "user", "content": prompt}],
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-    )
-    # Strip markdown code fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    try:
-        mapping: Dict[str, Optional[str]] = json.loads(raw)
-        return mapping
-    except json.JSONDecodeError:
-        if retry:
-            # Retry with stricter prompt
-            strict = (
-                "Your previous response was not valid JSON.  "
-                "Reply with ONLY a raw JSON object, no explanation, no fences.\n\n"
-                + prompt
-            )
-            raw2 = _llm_call(
-                [{"role": "user", "content": strict}],
-                api_key=api_key,
-                model=model,
-                base_url=base_url,
-            )
-            raw2 = re.sub(r"^```(?:json)?\s*", "", raw2)
-            raw2 = re.sub(r"\s*```$", "", raw2)
-            return json.loads(raw2)
-        raise
+    label_col = headers[0]
+    data_cols = headers[1:]
 
+    mapped_lookup: dict[str, dict[str, Any]] = {}
+    for row in mapped_data.get("mapped_rows", []):
+        key = str(row.get("template_row_label", "")).strip().lower()
+        if key:
+            mapped_lookup[key] = row
 
-# ---------------------------------------------------------------------------
-# 6. Excel writing (openpyxl)
-# ---------------------------------------------------------------------------
+    for row_offset, (_, template_row) in enumerate(template_df.iterrows(), start=2):
+        excel_row = row_offset
+        row_label = str(template_row[label_col])
+        lookup_key = row_label.strip().lower()
+        mapped_row = mapped_lookup.get(lookup_key, {})
 
-def fuzzy_match_sheet(
-    sheet_names: List[str], statement_type: str
-) -> Optional[str]:
-    """Return the best-matching sheet name or None."""
-    from thefuzz import fuzz
+        label_cell = ws.cell(row=excel_row, column=1, value=row_label)
+        label_cell.font = Font(bold=True)
+        label_cell.alignment = Alignment(horizontal="left", vertical="center")
+        label_cell.border = thin_border
 
-    best_name, best_score = None, 0
-    for name in sheet_names:
-        score = fuzz.token_sort_ratio(name.lower(), statement_type.lower())
-        if score > best_score:
-            best_score = score
-            best_name = name
-    if best_score >= FUZZY_THRESHOLD:
-        return best_name
-    return None
+        values = mapped_row.get("values", {}) if isinstance(mapped_row, dict) else {}
+        for j, col_name in enumerate(data_cols, start=2):
+            raw_value = values.get(col_name)
+            number = _normalize_numeric(raw_value)
+            if number is None:
+                cell = ws.cell(row=excel_row, column=j, value=None)
+            else:
+                cell = ws.cell(row=excel_row, column=j, value=number)
+                cell.number_format = "#,##0.00" if isinstance(number, float) else "#,##0"
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                if float(number) < 0:
+                    cell.font = Font(color="FF0000")
+            cell.border = thin_border
 
+        confidence = mapped_row.get("confidence", "") if isinstance(mapped_row, dict) else ""
+        notes_cell = ws.cell(row=excel_row, column=len(output_headers), value=confidence)
+        notes_cell.alignment = Alignment(horizontal="center", vertical="center")
+        notes_cell.border = thin_border
 
-def write_to_template(
-    template_bytes: bytes,
-    results: Dict[str, Dict],
-    pdf_filename: str,
-) -> bytes:
-    """Populate the Excel template with mapped data and return bytes.
-
-    *results* structure per statement:
-      {
-        "statement_type": str,
-        "page": int,
-        "mapping": {template_label: matched_label},
-        "values": {matched_label: [val1, val2, ...]},   # one per period column
-        "scale": str,
-      }
-    """
-    from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(template_bytes))
-    sheet_names = wb.sheetnames
-
-    for stmt_key, data in results.items():
-        stmt_type = data["statement_type"]
-        matched_sheet = fuzzy_match_sheet(sheet_names, stmt_type)
-        if matched_sheet is None:
-            continue
-
-        ws = wb[matched_sheet]
-        mapping: Dict[str, Optional[str]] = data.get("mapping", {})
-        values: Dict[str, List[Optional[float]]] = data.get("values", {})
-        scale = data.get("scale", "Unknown")
-        page = data.get("page", "?")
-
-        # Walk column A to find template labels, then fill values rightward.
-        for row_idx in range(1, ws.max_row + 1):
-            cell_val = ws.cell(row=row_idx, column=1).value
-            if cell_val is None:
-                continue
-            label = str(cell_val).strip()
-            matched_label = mapping.get(label)
-            if matched_label is None:
-                continue
-            nums = values.get(matched_label, [])
-            for col_offset, num in enumerate(nums):
-                # Write starting from column B (2)
-                ws.cell(row=row_idx, column=2 + col_offset, value=num)
-
-        # Add metadata note in a cell below the data
-        meta_row = ws.max_row + 2
-        ws.cell(row=meta_row, column=1, value="— Source metadata —")
-        ws.cell(row=meta_row + 1, column=1, value=f"PDF: {pdf_filename}")
-        ws.cell(row=meta_row + 2, column=1, value=f"Page: {page}")
-        ws.cell(
-            row=meta_row + 3,
-            column=1,
-            value=f"Extracted: {datetime.datetime.now().isoformat(timespec='seconds')}",
-        )
-        ws.cell(row=meta_row + 4, column=1, value=f"Scale: {scale}")
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# 7. Streamlit UI
-# ---------------------------------------------------------------------------
-
-def _df_to_markdown(df: pd.DataFrame, max_rows: int = 60) -> str:
-    """Convert a DataFrame to a compact Markdown table for LLM context."""
-    return df.head(max_rows).to_markdown(index=False)
-
-
-def _build_values_dict(
-    df: pd.DataFrame,
-    mapping: Dict[str, Optional[str]],
-) -> Dict[str, List[Optional[float]]]:
-    """For each *matched* extracted row label, pull numeric values from all
-    numeric columns in the DataFrame.  Returns {label: [v1, v2, …]}."""
-    num_cols = detect_numeric_columns(df)
-    if not num_cols:
-        # Fallback: treat all columns except the first as numeric
-        num_cols = list(range(1, df.shape[1]))
-
-    # Build a lookup: row_label → row_index (use column 0 as label column)
-    label_col = 0
-    label_to_row: Dict[str, int] = {}
-    for idx in range(df.shape[0]):
-        lbl = str(df.iloc[idx, label_col]).strip()
-        if lbl and lbl not in label_to_row:
-            label_to_row[lbl] = idx
-
-    values: Dict[str, List[Optional[float]]] = {}
-    for tpl_label, ext_label in mapping.items():
-        if ext_label is None:
-            continue
-        row_idx = label_to_row.get(ext_label)
-        if row_idx is None:
-            # Try fuzzy substring match
-            for k, v in label_to_row.items():
-                if ext_label.lower() in k.lower() or k.lower() in ext_label.lower():
-                    row_idx = v
-                    break
-        if row_idx is None:
-            values[ext_label] = []
-            continue
-        row_vals: List[Optional[float]] = []
-        for ci in num_cols:
-            row_vals.append(parse_numeric(str(df.iloc[row_idx, ci])))
-        values[ext_label] = row_vals
-    return values
-
-
-def main() -> None:
-    st.set_page_config(page_title="SoFi FinModel Tool", layout="wide")
-    st.title("📊 SoFi FinModel Tool")
-    st.caption(
-        "Extract financial statement tables from digital PDFs into your Excel template."
-    )
-
-    # ---- Sidebar: settings ------------------------------------------------
-    with st.sidebar:
-        st.header("Settings")
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            value=os.getenv("OPENAI_API_KEY", ""),
-            help="Also reads from OPENAI_API_KEY env var / .env",
-        )
-        base_url = st.text_input(
-            "API Base URL (optional)",
-            value=os.getenv("OPENAI_BASE_URL", ""),
-            help="Leave blank for default OpenAI endpoint",
-        )
-        model = st.selectbox(
-            "Model",
-            ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
-            index=0,
-        )
-        flavor_override = st.selectbox(
-            "Camelot flavor",
-            ["auto (lattice→stream)", "lattice", "stream"],
-            index=0,
-        )
-        camelot_flavor = (
-            "lattice"
-            if flavor_override.startswith("auto")
-            else flavor_override
-        )
-
-    # ---- Main area --------------------------------------------------------
-    col_pdf, col_xl = st.columns(2)
-    with col_pdf:
-        pdf_file = st.file_uploader("Upload PDF report", type=["pdf"])
-    with col_xl:
-        xl_file = st.file_uploader("Upload Excel template", type=["xlsx"])
-
-    selected_stmts = st.multiselect(
-        "Statements to extract",
-        STATEMENT_TYPES,
-        default=STATEMENT_TYPES[:1],
-    )
-
-    # Page hints — one number input per selected statement
-    page_hints: Dict[str, Optional[int]] = {}
-    if selected_stmts:
-        st.markdown("**Page hints** *(optional — leave 0 for auto-detection)*")
-        hint_cols = st.columns(len(selected_stmts))
-        for i, stmt in enumerate(selected_stmts):
-            with hint_cols[i]:
-                val = st.number_input(
-                    stmt, min_value=0, value=0, step=1, key=f"page_{stmt}"
-                )
-                page_hints[stmt] = val if val > 0 else None
-
-    extract_btn = st.button("🚀 Extract", type="primary", disabled=not (pdf_file and xl_file and api_key))
-
-    if not extract_btn:
-        st.info("Upload both files, enter your API key, then click **Extract**.")
-        return
-
-    # ---- Pipeline ---------------------------------------------------------
-    # Write uploaded PDF to a temp file (camelot needs a path)
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_file.read())
-        pdf_path = tmp.name
-
-    xl_bytes = xl_file.read()
-
-    # Read template labels per sheet
-    template_sheets: Dict[str, List[str]] = {}
-    from openpyxl import load_workbook as _lwb
-
-    twb = _lwb(io.BytesIO(xl_bytes), data_only=True)
-    for sn in twb.sheetnames:
-        ws = twb[sn]
-        labels = []
-        for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
-            val = row[0]
-            if val is not None:
-                labels.append(str(val).strip())
-        template_sheets[sn] = labels
-
-    all_results: Dict[str, Dict[str, Any]] = {}
-
-    for stmt in selected_stmts:
-        st.subheader(f"📄 {stmt}")
-        progress = st.status(f"Processing {stmt}…", expanded=True)
-
-        # --- Step 1: locate pages -----------------------------------------
-        progress.write("🔍 Locating pages…")
-        hint = page_hints.get(stmt)
-        if hint:
-            candidate_pages = [hint]
-        else:
-            candidate_pages = find_pages_for_statement(pdf_path, stmt)
-            if not candidate_pages:
-                progress.warning(
-                    f"No pages with keyword matches for **{stmt}**. "
-                    "Provide a page hint and retry."
-                )
-                progress.update(label=f"{stmt} — no pages found", state="error")
-                continue
-
-        progress.write(f"Candidate pages: {candidate_pages}")
-
-        # --- Step 2: extract tables ---------------------------------------
-        progress.write("📐 Extracting tables with Camelot…")
-        best_df: Optional[pd.DataFrame] = None
-        chosen_page: Optional[int] = None
-
-        for pg in candidate_pages:
-            dfs = extract_tables_from_page(pdf_path, pg, flavor=camelot_flavor)
-            if not dfs:
-                continue
-            cand = pick_best_table(dfs)
-            if cand is not None and (best_df is None or len(cand) > len(best_df)):
-                best_df = cand
-                chosen_page = pg
-
-        if best_df is None:
-            progress.warning(
-                f"No tables extracted on pages {candidate_pages} for **{stmt}**."
-            )
-            progress.update(label=f"{stmt} — no tables", state="error")
-            continue
-
-        progress.write(f"Best table from page {chosen_page}: {best_df.shape[0]} rows × {best_df.shape[1]} cols")
-
-        # Show raw extracted table
-        with st.expander(f"Raw extracted table — page {chosen_page}", expanded=False):
-            st.dataframe(best_df, use_container_width=True)
-
-        # --- Step 2b (optional): LLM classification ----------------------
-        if not hint:
-            progress.write("🤖 Confirming statement type via LLM…")
-            table_md = _df_to_markdown(best_df)
-            confirmed = classify_table_as_statement(
-                table_md, stmt, api_key, model, base_url or None
-            )
-            if not confirmed:
-                progress.warning(
-                    f"LLM did not confirm this table as **{stmt}**. Proceeding anyway — review carefully."
+        label_lower = row_label.lower()
+        if "total" in label_lower or "sub-total" in label_lower or "subtotal" in label_lower:
+            for col_idx in range(1, len(output_headers) + 1):
+                c = ws.cell(row=excel_row, column=col_idx)
+                c.font = Font(bold=True, color=c.font.color.rgb if c.font and c.font.color else None)
+                c.border = Border(
+                    left=c.border.left,
+                    right=c.border.right,
+                    top=total_top_border.top,
+                    bottom=c.border.bottom,
                 )
 
-        # --- Step 3: LLM row mapping --------------------------------------
-        progress.write("🗂️ Mapping rows via LLM…")
-        # Find template sheet for this statement
-        matched_sheet = fuzzy_match_sheet(list(template_sheets.keys()), stmt)
-        if matched_sheet is None:
-            progress.warning(
-                f"No matching sheet in template for **{stmt}**. Skipping."
-            )
-            progress.update(label=f"{stmt} — no matching sheet", state="error")
-            continue
+    for col_idx, header in enumerate(output_headers, start=1):
+        max_len = len(str(header))
+        for row_idx in range(2, ws.max_row + 1):
+            value = ws.cell(row=row_idx, column=col_idx).value
+            display = "" if value is None else str(value)
+            max_len = max(max_len, len(display))
+        ws.column_dimensions[chr(64 + col_idx)].width = min(max(12, int(max_len * 1.2)), 60)
 
-        tpl_labels = template_sheets[matched_sheet]
-        table_md = _df_to_markdown(best_df)
-        try:
-            mapping = map_rows_with_llm(
-                table_md, tpl_labels, api_key, model, base_url or None
-            )
-        except (json.JSONDecodeError, Exception) as exc:
-            progress.error(f"LLM mapping failed: {exc}")
-            progress.update(label=f"{stmt} — mapping error", state="error")
-            continue
+    ws.freeze_panes = "B2"
 
-        # --- Build values dict -----------------------------------------------
-        values = _build_values_dict(best_df, mapping)
-        scale = detect_scale_from_header(best_df)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
-        # --- Show mapping preview & allow overrides --------------------------
-        preview_rows = []
-        for tpl_lbl in tpl_labels:
-            ext_lbl = mapping.get(tpl_lbl)
-            vals = values.get(ext_lbl, []) if ext_lbl else []
-            preview_rows.append(
-                {
-                    "Template Row": tpl_lbl,
-                    "Matched PDF Row": ext_lbl or "—",
-                    "Values": ", ".join(
-                        str(v) if v is not None else "" for v in vals
-                    ),
-                }
-            )
-        preview_df = pd.DataFrame(preview_rows)
 
-        st.markdown(f"**Mapping preview** (sheet: *{matched_sheet}*)")
-        edited_preview = st.data_editor(
-            preview_df,
-            key=f"editor_{stmt}",
-            use_container_width=True,
-            num_rows="fixed",
-        )
+# ============================================================
+# SECTION 7: LLM PROMPT TEMPLATES
+# ============================================================
 
-        # Rebuild mapping from (possibly user-edited) preview
-        final_mapping: Dict[str, Optional[str]] = {}
-        for _, row in edited_preview.iterrows():
-            tpl = row["Template Row"]
-            ext = row["Matched PDF Row"]
-            final_mapping[tpl] = ext if ext != "—" else None
+@st.cache_data(show_spinner=False)
+def parse_template_csv(template_bytes: bytes) -> tuple[pd.DataFrame, str]:
+    """Parse uploaded template CSV bytes.
 
-        # Rebuild values in case user changed matched rows
-        final_values = _build_values_dict(best_df, final_mapping)
+    Args:
+        template_bytes: Raw CSV bytes from upload.
 
-        all_results[stmt] = {
-            "statement_type": stmt,
-            "page": chosen_page,
-            "mapping": final_mapping,
-            "values": final_values,
-            "scale": scale,
+    Returns:
+        Tuple of parsed DataFrame and UTF-8 decoded CSV string.
+    """
+    text = template_bytes.decode("utf-8", errors="replace")
+    return pd.read_csv(io.StringIO(text)), text
+
+
+def build_mapped_preview_df(mapped_data: dict[str, Any], template_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a table preview that follows template structure plus confidence.
+
+    Args:
+        mapped_data: Parsed mapping JSON.
+        template_df: Template DataFrame.
+
+    Returns:
+        Preview DataFrame.
+    """
+    headers = list(template_df.columns)
+    label_col = headers[0]
+    data_cols = headers[1:]
+
+    mapped_lookup: dict[str, dict[str, Any]] = {}
+    for row in mapped_data.get("mapped_rows", []):
+        key = str(row.get("template_row_label", "")).strip().lower()
+        if key:
+            mapped_lookup[key] = row
+
+    rows_out: list[dict[str, Any]] = []
+    for _, row in template_df.iterrows():
+        label = str(row[label_col])
+        mapped = mapped_lookup.get(label.strip().lower(), {})
+        values = mapped.get("values", {}) if isinstance(mapped, dict) else {}
+
+        out: dict[str, Any] = {label_col: label}
+        for c in data_cols:
+            out[c] = values.get(c)
+        out["Notes"] = mapped.get("confidence") if isinstance(mapped, dict) else None
+        rows_out.append(out)
+
+    return pd.DataFrame(rows_out)
+
+
+def summarize_confidence(mapped_data: dict[str, Any]) -> dict[str, int]:
+    """Count confidence classes from mapped rows.
+
+    Args:
+        mapped_data: Parsed mapping JSON.
+
+    Returns:
+        Dict with high/medium/low counts.
+    """
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for row in mapped_data.get("mapped_rows", []):
+        conf = str(row.get("confidence", "")).strip().lower()
+        if conf in counts:
+            counts[conf] += 1
+    return counts
+
+
+# ============================================================
+# SECTION 8: STREAMLIT UI — SIDEBAR
+# ============================================================
+
+st.title("FinStatement Parser")
+st.caption("Extract financial statement tables from PDF, map to template CSV with an LLM, and export Excel.")
+
+with st.sidebar:
+    st.header("🤖 LLM Configuration")
+
+    provider = st.selectbox("Provider", options=["OpenAI", "Anthropic", "Google Gemini"])
+
+    env_key_name = {
+        "OpenAI": "OPENAI_API_KEY",
+        "Anthropic": "ANTHROPIC_API_KEY",
+        "Google Gemini": "GOOGLE_API_KEY",
+    }[provider]
+    default_key = os.getenv(env_key_name, "")
+
+    api_key = st.text_input(
+        "API Key",
+        type="password",
+        value=default_key,
+        help="Your key is not stored anywhere.",
+    )
+
+    current_models = st.session_state["available_models"].get(provider, FALLBACK_MODELS[provider])
+
+    fetch_col, refresh_col = st.columns([2, 1])
+    with fetch_col:
+        if st.button("Fetch Models", use_container_width=True):
+            with st.spinner("Fetching models..."):
+                current_models = fetch_available_models(provider, api_key)
+    with refresh_col:
+        if st.button("Reset", use_container_width=True):
+            st.session_state["available_models"][provider] = FALLBACK_MODELS[provider]
+            current_models = FALLBACK_MODELS[provider]
+
+    model = st.selectbox(
+        "Model",
+        options=current_models,
+        index=0 if current_models else None,
+        disabled=not current_models,
+    )
+
+    with st.expander("⚙️ Camelot Settings", expanded=False):
+        flavor = st.selectbox("Flavor", options=["lattice", "stream"], index=0)
+        line_scale = st.slider("Line Scale", min_value=15, max_value=150, value=40)
+        split_text = st.checkbox("Split Text", value=True)
+        flag_size = st.checkbox("Flag Size", value=True)
+        strip_text = st.text_input("Strip Text", value="\\n")
+        edge_tol = st.slider("Edge Tolerance", min_value=0, max_value=500, value=50)
+        row_tol = st.slider("Row Tolerance", min_value=0, max_value=50, value=2)
+
+        st.session_state["camelot_settings"] = {
+            "flavor": flavor,
+            "line_scale": line_scale,
+            "split_text": split_text,
+            "flag_size": flag_size,
+            "strip_text": strip_text,
+            "edge_tol": edge_tol,
+            "row_tol": row_tol,
         }
 
-        progress.update(label=f"{stmt} ✅", state="complete")
+        if flavor == "lattice":
+            st.info("Lattice works best for bordered tables.")
+        else:
+            st.info("Stream works best for borderless tables and text-aligned tables.")
 
-    # --- Step 4: write to Excel & offer download --------------------------
-    if all_results:
-        st.divider()
-        st.subheader("📥 Download populated Excel")
-        out_bytes = write_to_template(
-            xl_bytes, all_results, pdf_file.name
-        )
-        st.download_button(
-            label="Download Excel",
-            data=out_bytes,
-            file_name=f"populated_{pdf_file.name.replace('.pdf', '.xlsx')}",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+
+# ============================================================
+# SECTION 9: STREAMLIT UI — MAIN CONTENT
+# ============================================================
+
+step1, step2, step3 = st.tabs(
+    ["📄 Step 1: Upload Files", "📋 Step 2: Review Extracted Data", "✅ Step 3: Mapped Output"]
+)
+
+with step1:
+    upload_col1, upload_col2 = st.columns(2)
+    with upload_col1:
+        pdf_upload = st.file_uploader("Upload PDF", type=["pdf"], key="pdf_uploader")
+    with upload_col2:
+        template_upload = st.file_uploader("Upload Template CSV", type=["csv"], key="template_uploader")
+
+    page_numbers = st.text_input("Page numbers", placeholder="e.g. 1,3,5-7")
+
+    if template_upload is not None:
+        try:
+            template_df, template_csv = parse_template_csv(template_upload.getvalue())
+            st.session_state["template_df"] = template_df
+            st.session_state["template_csv"] = template_csv
+            st.success("Template CSV loaded successfully.")
+        except Exception as exc:  # pylint: disable=broad-except
+            st.error(f"Failed to parse template CSV: {exc}")
+            with st.expander("🔍 Debug: Template Parse Traceback"):
+                st.code(traceback.format_exc(), language="text")
+
+    if st.button("Extract Tables ▶", type="primary", use_container_width=False):
+        if pdf_upload is None:
+            st.error("Please upload a PDF file.")
+        elif not page_numbers.strip():
+            st.error("Please enter page numbers (example: 1,3,5-7).")
+        elif st.session_state["template_df"] is None:
+            st.error("Please upload a template CSV before extraction.")
+        else:
+            tmp_path = ""
+            try:
+                with st.spinner("Extracting tables with Camelot..."):
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(pdf_upload.getvalue())
+                        tmp_path = tmp.name
+
+                    try:
+                        reader = PdfReader(tmp_path)
+                        page_count = len(reader.pages)
+                        st.info(f"PDF loaded with {page_count} pages. Camelot pages are 1-indexed.")
+                    except Exception:
+                        pass
+
+                    flavor_value = st.session_state["camelot_settings"].get("flavor", "lattice")
+                    tables, csvs = extract_tables_from_pdf(tmp_path, page_numbers.strip(), flavor=flavor_value)
+                    st.session_state["extracted_tables"] = tables
+                    st.session_state["extracted_csvs"] = csvs
+                    st.session_state["mapped_data"] = None
+
+                if not tables:
+                    st.warning("No tables were extracted. Verify page numbers, then try 'stream' flavor if needed.")
+                    st.info("Camelot works on text-based PDFs. If this is a scanned PDF, run OCR first.")
+                else:
+                    st.success(f"Extracted {len(tables)} table(s).")
+            except Exception as exc:  # pylint: disable=broad-except
+                st.error(f"Failed to extract tables: {exc}")
+                with st.expander("🔍 Debug: Extraction Traceback"):
+                    st.code(traceback.format_exc(), language="text")
+                if "ghostscript" in str(exc).lower():
+                    st.error("Ghostscript appears missing. Install it at OS level and retry.")
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+with step2:
+    extracted_tables = st.session_state["extracted_tables"]
+    reports = st.session_state.get("parsing_reports", [])
+
+    if extracted_tables:
+        for i, table_df in enumerate(extracted_tables, start=1):
+            report = reports[i - 1] if i - 1 < len(reports) else {}
+            accuracy = report.get("accuracy", "n/a")
+            page = report.get("page", "?")
+            whitespace = report.get("whitespace", "n/a")
+
+            st.markdown(f"**Table {i} (Page {page})**")
+            st.caption(f"Accuracy: {accuracy}% | Whitespace: {whitespace}")
+            st.dataframe(table_df, use_container_width=True, height=250)
+
+            if isinstance(accuracy, (float, int)) and float(accuracy) < 85:
+                st.warning(
+                    "Low extraction accuracy detected. Consider changing Camelot flavor/settings and retrying."
+                )
+
+        if st.session_state["template_df"] is not None:
+            st.markdown("**Template Preview**")
+            st.dataframe(st.session_state["template_df"], use_container_width=True, height=250)
+
+        if st.button("Map to Template ▶", type="primary"):
+            if not api_key:
+                st.error("Please provide an API key in the sidebar.")
+            elif not model:
+                st.error("Please select a model.")
+            elif st.session_state["template_csv"] is None:
+                st.error("Template CSV is missing. Re-upload the template in Step 1.")
+            elif not st.session_state["extracted_csvs"]:
+                st.error("No extracted table CSVs found. Extract tables first.")
+            else:
+                user_prompt = build_mapping_prompt(
+                    st.session_state["extracted_csvs"],
+                    st.session_state["template_csv"],
+                )
+
+                last_error = None
+                with st.spinner("Mapping extracted data to template with LLM..."):
+                    for attempt in range(1, 4):
+                        try:
+                            raw_response = call_llm(
+                                provider=provider,
+                                model=model,
+                                api_key=api_key,
+                                system_prompt=MAPPING_SYSTEM_PROMPT,
+                                user_prompt=user_prompt,
+                            )
+                            st.session_state["llm_raw_response"] = raw_response
+                            mapped = parse_llm_response(raw_response)
+                            validate_mapped_data_structure(mapped)
+                            st.session_state["mapped_data"] = mapped
+                            st.success(f"Mapping completed successfully on attempt {attempt}.")
+                            last_error = None
+                            break
+                        except Exception as exc:  # pylint: disable=broad-except
+                            last_error = exc
+
+                if last_error is not None:
+                    st.error(f"Failed to parse/validate LLM output after retries: {last_error}")
+                    st.warning("Try a different model or re-run mapping. Review raw response in debug section.")
     else:
-        st.warning("No statements were successfully extracted.")
+        st.info("Extract tables in Step 1 to review them here.")
 
-    # Cleanup temp file
-    try:
-        os.unlink(pdf_path)
-    except OSError:
-        pass
+with step3:
+    mapped_data = st.session_state["mapped_data"]
+    template_df = st.session_state["template_df"]
 
+    if mapped_data and template_df is not None:
+        counts = summarize_confidence(mapped_data)
+        metric_c1, metric_c2, metric_c3 = st.columns(3)
+        metric_c1.metric("🟢 High", counts["high"])
+        metric_c2.metric("🟡 Medium", counts["medium"])
+        metric_c3.metric("🔴 Low", counts["low"])
 
-if __name__ == "__main__":
-    main()
+        confidence_notes = mapped_data.get("confidence_notes", [])
+        if confidence_notes:
+            st.markdown("**Confidence Notes**")
+            for note in confidence_notes:
+                st.write(f"- {note}")
+
+        unmapped = mapped_data.get("unmapped_extracted_rows", [])
+        unfilled = mapped_data.get("unfilled_template_rows", [])
+        if unmapped:
+            st.warning(f"Unmapped extracted rows: {', '.join(map(str, unmapped))}")
+        if unfilled:
+            st.warning(f"Template rows with no data: {', '.join(map(str, unfilled))}")
+
+        preview_df = build_mapped_preview_df(mapped_data, template_df)
+        st.markdown("**Mapped Data Preview**")
+        st.dataframe(preview_df, use_container_width=True, height=350)
+
+        try:
+            excel_bytes = generate_excel(mapped_data, template_df)
+            d1, d2 = st.columns([2, 1])
+            with d1:
+                st.download_button(
+                    label="⬇ Download Excel",
+                    data=excel_bytes,
+                    file_name="finstatement_mapped_output.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with d2:
+                if st.button("🔄 Re-run Mapping", use_container_width=True):
+                    st.session_state["mapped_data"] = None
+                    st.rerun()
+        except Exception as exc:  # pylint: disable=broad-except
+            st.error(f"Excel generation failed: {exc}")
+            with st.expander("🔍 Debug: Excel Traceback"):
+                st.code(traceback.format_exc(), language="text")
+    else:
+        st.info("Run mapping in Step 2 to view mapped output and download Excel.")
+
+with st.expander("🔍 Debug: Raw LLM Response", expanded=False):
+    raw_resp = st.session_state.get("llm_raw_response")
+    if raw_resp:
+        st.code(raw_resp, language="json")
+    else:
+        st.write("No LLM response yet.")
